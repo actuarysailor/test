@@ -7,7 +7,6 @@ on:
 jobs:
   list-env-vars:
     name: List Environment Variables
-    runs-on: self-hosted
     steps:
       - run: |
           printenv
