@@ -1,0 +1,19 @@
+name: 'List Environment Variables'
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  list-env-vars:
+    name: List Environment Variables
+    runs-on: self-hosted
+    steps:
+      - run: |
+          printenv
+          echo "github.event.pull_request.head.ref = ${{ github.event.pull_request.head.ref }}"
+          echo "github.event.pull_request_target.head.ref = ${{ github.event.pull_request_target.head.ref }}"
+          echo "${{ fromJSON('["push"]') }}"
+          echo "github.event_name = ${{ github.event_name }}"
+          echo "github.repository = ${{ github.repository }}"
+          echo "github.repository_owner = ${{ github.repository_owner }}"
