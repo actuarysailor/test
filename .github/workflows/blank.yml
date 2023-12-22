@@ -7,6 +7,7 @@ on:
 jobs:
   list-env-vars:
     name: List Environment Variables
+    runs-on: ubuntu-latest
     steps:
       - run: |
           printenv
