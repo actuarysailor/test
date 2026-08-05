@@ -1,1 +1,688 @@
-SAMPLE
+# Manage Administrative Repository Settings from Pull Requests
+
+<!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
+[![All Contributors](https://img.shields.io/badge/all_contributors-2-orange.svg?style=flat-square)](#contributors-)
+<!-- ALL-CONTRIBUTORS-BADGE:END -->
+
+<!-- action-docs-description source="action.yml" -->
+### Description
+
+Manage all Github repo settings from a YAML file, enabling greater change control, transparency, and auditability.
+<!-- action-docs-description source="action.yml" -->
+
+---
+
+## Table of Contents
+
+- [Why Use This?](#why-use-this)
+- [Quick Start](#quick-start)
+- [Authentication](#authentication)
+  - [GitHub App (recommended)](#github-app-recommended)
+  - [Personal Access Token (PAT)](#personal-access-token-pat)
+  - [Required Permissions](#required-permissions)
+- [Action Inputs & Outputs](#action-inputs--outputs)
+- [The `settings.yml` Schema](#the-settingsyml-schema)
+  - [Repository Settings](#repository-settings)
+  - [Collaborators](#collaborators)
+  - [Labels](#labels)
+  - [Branch Protections (legacy)](#branch-protections-legacy)
+  - [Rulesets](#rulesets)
+  - [Secrets](#secrets)
+  - [Variables](#variables)
+  - [Environments](#environments)
+  - [File Sync (`batch_file_operations`)](#file-sync-batch_file_operations)
+    - [Grouping files with their own commit messages](#grouping-files-with-their-own-commit-messages)
+    - [Managed vs seeded files](#managed-vs-seeded-files)
+- [Usage Patterns](#usage-patterns)
+  - [Self-managed (single repo)](#self-managed-single-repo)
+  - [Centralized governance (many repos)](#centralized-governance-many-repos)
+  - [Drift detection on pull requests](#drift-detection-on-pull-requests)
+- [Debugging](#debugging)
+- [Contributing](#contributing)
+
+---
+
+## Why Use This?
+
+- **Principle of least privilege for contributors** — contributors without repo admin rights can propose admin-level changes (branch protections, secrets, environments, etc.) via a pull request, subject to review by owners and maintainers.
+- **Audit trail** — every change is a git commit, reviewed in a PR, and attributed to a bot identity rather than a person's account (when using a GitHub App).
+- **Centralized governance** — run from a `.github` org repo or any central repo to enforce consistent settings, workflows, labels, and access control across many repos at once.
+- **Drift detection** — run in `check` mode on a schedule or on PR to surface configuration drift before it becomes a problem.
+
+---
+
+## Quick Start
+
+1. Create a `.github/settings.yml` in your repo (see [The `settings.yml` Schema](#the-settingsyml-schema)).
+2. Add this workflow:
+
+```yaml
+name: Repo Manager
+on:
+  push:
+    branches: [main]
+    paths: ['.github/settings.yml']
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actuarysailor/gha-repo-manager@v2.2.3
+        with:
+          action: apply
+          settings_file: .github/settings.yml
+          token: ${{ secrets.GITHUB_PAT }}
+```
+
+3. Push a change to `.github/settings.yml` — the action will apply it automatically.
+
+> For production use, prefer a **GitHub App** over a PAT. See [Authentication](#authentication).
+
+---
+
+## Authentication
+
+### GitHub App (recommended)
+
+Using a GitHub App means all activity is attributed to a **bot identity**, not a person's account. This provides a cleaner audit trail, avoids consuming user rate-limit quota, and is the best choice for scheduled or cross-repo workflows.
+
+**Setup:**
+
+1. [Create a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app) with the permissions from the table below.
+2. Install the app on the organizations and/or repos you want it to manage.
+3. Store the **App ID** as a variable (e.g. `REPO_MANAGER_APP_ID`) — it is not a secret.
+4. Store the **Private Key** as a secret (e.g. `REPO_MANAGER_PRIVATE_KEY`).
+
+```yaml
+- uses: actuarysailor/gha-repo-manager@v2.2.3
+  with:
+    action: apply
+    settings_file: .github/settings.yml
+    app_id: ${{ vars.REPO_MANAGER_APP_ID }}
+    private_key: ${{ secrets.REPO_MANAGER_PRIVATE_KEY }}
+```
+
+### Personal Access Token (PAT)
+
+A PAT is simpler for ad-hoc or manual runs where you want activity attributed to your own account.
+
+```yaml
+- uses: actuarysailor/gha-repo-manager@v2.2.3
+  with:
+    action: apply
+    settings_file: .github/settings.yml
+    token: ${{ secrets.GITHUB_PAT }}
+```
+
+> **Tip:** Use a [fine-grained PAT](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token) scoped to only the repos and permissions you need.
+
+### Required Permissions
+
+The action will **not fail** when the token or app lacks permission for a category — it emits a warning in the run log and step summary listing the missing permission, then continues with the remaining categories.
+
+Grant only the permissions you need for the features you use:
+
+| `settings.yml` section | GitHub App permission | PAT scope | Notes |
+|---|---|---|---|
+| `settings` | `administration: write` | `repo` | Repo settings, merge strategies, default branch |
+| `collaborators` | `members: write` (org repos)<br>`administration: write` (user repos) | `repo` | User and team access |
+| `labels` | `issues: write` | `repo` | Issue and PR labels |
+| `branch_protections` | `administration: write` | `repo` | Legacy branch protection rules (deprecated — prefer `rulesets`) |
+| `rulesets` | `administration: write` | `repo` | Branch/tag rulesets (recommended replacement for `branch_protections`) |
+| `secrets` (Actions) | `secrets: write` | `repo` | Actions secrets |
+| `secrets` (Dependabot) | `dependabot_secrets: write` | `repo`, `admin:org` | Dependabot secrets |
+| `variables` | `variables: write` | `repo` | Actions variables |
+| `environments` | `environments: write`, `actions: read` | `repo` | Deployment environments, env secrets & variables |
+| `batch_file_operations` | `contents: write`, `pull_requests: write` | `repo` | File sync; creates/updates PRs |
+
+> **Note on `environments`:** The GitHub API requires `actions: read` in addition to `environments: write` for the list-environments endpoint — grant both or the category will be skipped with a permission warning.
+
+**Minimum permissions for common scenarios:**
+
+| Scenario | GitHub App permissions | PAT scopes |
+|---|---|---|
+| Read-only drift check (`action: check`) | `administration: read`, `contents: read`, `issues: read`, `secrets: read` | `repo` (read-only fine-grained PAT) |
+| Labels only | `issues: write` | `repo` |
+| Full management | All permissions above | `repo`, `admin:org` |
+
+---
+
+## Action Inputs & Outputs
+
+<!-- action-docs-inputs source="action.yml" -->
+### Inputs
+
+| name | description | required | default |
+| --- | --- | --- | --- |
+| `action` | <p>What action to take with this action. One of validate, check, or apply. Validate will validate your settings file, but not touch your repo. Check will check your repo with your settings file and output a report of any drift. Apply will apply the settings in your settings file to your repo</p> | `false` | `check` |
+| `settings_file` | <p>What yaml file to use as your settings. This is local to runner running this action.</p> | `false` | `.github/settings.yml` |
+| `target` | <p>What to perform this action on. Use 'owner/repo' for a repository, an org login for org scope, or an enterprise slug for enterprise scope. Default is 'self' (the repo this action is running in).</p> | `false` | `self` |
+| `scope` | <p>Explicit scope of the target: 'repo', 'org', or 'enterprise'. Required when target does not contain '/' and is not 'self'.</p> | `false` | `""` |
+| `repo` | <p>DEPRECATED: Use 'target' instead. Kept for backward compatibility. If 'target' is not set, the value of 'repo' will be used.</p> | `false` | `""` |
+| `github_server_url` | <p>Set a custom github server url for github api operations. Useful if you're running on GHE. Will try to autodiscover from env.GITHUB<em>SERVER</em>URL if left at default</p> | `false` | `""` |
+| `token` | <p>What github token to use with this action (one of token or app_id is required).</p> | `false` | `""` |
+| `app_id` | <p>What github app id to use with this action (one of token or app_id is required).</p> | `false` | `""` |
+| `private_key` | <p>What github app private key to use with this action (required if using an app_id to authenticate).</p> | `false` | `""` |
+| `fail_on_diff` | <p>Fail the action if the repo settings differ from the settings file. Default is false. Note, this only applies if the action is set to 'check'</p> | `false` | `false` |
+<!-- action-docs-inputs source="action.yml" -->
+
+<!-- action-docs-outputs source="action.yml" -->
+### Outputs
+
+| name | description |
+| --- | --- |
+| `result` | <p>Result of the action</p> |
+| `result_code` | <p>Machine-readable status code. Values: validate<em>passed, check</em>passed, check<em>diff, check</em>failed<em>diff, check</em>failed, apply<em>passed, apply</em>failed</p> |
+| `diff` | <p>Diff of this action, dumped to a json string</p> |
+| `diff_detected` | <p>For check action only: true when diffs are detected, otherwise false</p> |
+| `warning_count` | <p>Total number of warning messages emitted by the action</p> |
+| `permission_warning_count` | <p>Number of permission-related warnings emitted by the action</p> |
+<!-- action-docs-outputs source="action.yml" -->
+
+<!-- action-docs-runs source="action.yml" -->
+### Runs
+
+This action is a `docker` action.
+<!-- action-docs-runs source="action.yml" -->
+
+---
+
+## The `settings.yml` Schema
+
+All sections are optional — omit any section to leave those settings untouched.
+
+See [`examples/settings.yml`](./examples/settings.yml) for a fully annotated reference file, and [`examples/settings-clear.yml`](./examples/settings-clear.yml) for an example that resets/removes everything.
+
+---
+
+### Repository Settings
+
+```yaml
+settings:
+  description: "A short description shown on GitHub."
+  homepage: "https://example.com"        # Set to "" to clear
+  topics:                                # Set to [] to clear; omit to leave unchanged
+    - my-topic
+  private: false
+  has_issues: true
+  has_projects: true
+  has_wiki: true
+  has_downloads: true
+  default_branch: main
+  allow_squash_merge: true
+  allow_merge_commit: false
+  allow_rebase_merge: false
+  delete_branch_on_merge: true
+  enable_automated_security_fixes: true
+  enable_vulnerability_alerts: true
+```
+
+Any setting that is omitted leaves the repo's current value unchanged. If a setting is present in `settings.yml`, it will always be enforced.
+
+---
+
+### Collaborators
+
+Controls user and team access to the repository. Setting `exists: false` removes a collaborator or team.
+
+Teams are resolved against the repository's organization. For nested teams, specify the parent team slug.
+
+```yaml
+collaborators:
+  - name: some-user         # GitHub username
+    type: user
+    permission: push        # push | pull | triage | maintain | admin | <custom role>
+    exists: true
+
+  - name: security-team     # Team slug (resolved against repo owner's org)
+    type: team
+    permission: maintain
+    exists: true
+
+  - name: automation        # Nested team (child of parent)
+    type: team
+    permission: push
+    parent_team_slug: security
+    exists: true
+
+  - name: old-user
+    type: user
+    permission: push
+    exists: false           # Removes this collaborator from the repo
+```
+
+---
+
+### Labels
+
+Creates, renames, or deletes issue/PR labels. A rename or delete targeting a label that doesn't exist emits a warning but does not fail the run.
+
+```yaml
+labels:
+  - name: help wanted
+    new_name: first-timers-only   # Renames the label
+    color: "0075ca"               # Hex color without #
+    description: "Good for newcomers"
+
+  - name: old-label
+    exists: false                 # Deletes the label
+```
+
+---
+
+### Branch Protections (legacy)
+
+> ⚠️ **Deprecated.** GitHub now recommends [Repository Rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets) over branch protection rules. Branch protection rules lack pattern-based targeting, bypass actor controls, and org-level inheritance. Use `rulesets` for new configurations. Set `exists: false` on any existing `branch_protections` entries to remove them after migrating.
+
+```yaml
+branch_protections:
+  - name: main
+    exists: false   # Removes the branch protection rule (migrate to rulesets instead)
+```
+
+Branch protection can only be applied to branches that already exist in the repo.
+
+---
+
+### Rulesets
+
+Rulesets are the modern replacement for branch protection rules. They support pattern-based ref targeting, bypass actor lists, and a richer set of rules. Rulesets can also be defined at the org level (org-level support coming in a future release).
+
+```yaml
+rulesets:
+  - name: Protect main
+    target: branch          # branch | tag | push
+    enforcement: active     # active | disabled | evaluate
+
+    # Optional: who can bypass this ruleset
+    bypass_actors:
+      - actor_id: 1         # Team/app/role ID — find via the GitHub API
+        actor_type: Team    # Integration | OrganizationAdmin | RepositoryRole | Team | DeployKey
+        bypass_mode: pull_request   # always | pull_request
+
+    # Which refs the ruleset applies to
+    conditions:
+      ref_name:
+        include:
+          - ~DEFAULT_BRANCH   # Magic token for the default branch
+          # - refs/heads/main  # Or specify explicitly
+          # - ~ALL             # All branches
+        exclude: []
+
+    rules:
+      # ── Simple rules (no parameters) ──────────────────────────────────────
+      - type: deletion                  # Prevent branch deletion
+      - type: non_fast_forward          # Prevent force pushes
+      - type: required_signatures       # Require signed commits
+      - type: required_linear_history   # No merge commits
+
+      # ── Pull request reviews ───────────────────────────────────────────────
+      - type: pull_request
+        parameters:
+          required_approving_review_count: 1
+          dismiss_stale_reviews_on_push: true
+          require_code_owner_review: false
+          require_last_push_approval: false
+          required_review_thread_resolution: true
+
+      # ── Required status checks ────────────────────────────────────────────
+      - type: required_status_checks
+        parameters:
+          strict_required_status_checks_policy: true   # Require branch to be up to date
+          do_not_enforce_on_create: false
+          required_status_checks:
+            - context: lint
+            - context: test
+              integration_id: 12345   # Optional: pin to a specific app's check
+
+      # ── Pattern rules ─────────────────────────────────────────────────────
+      # operator: starts_with | ends_with | contains | regex
+      - type: branch_name_pattern
+        parameters:
+          operator: regex
+          pattern: '^(main|release/.+)$'
+          negate: true    # Blocks branches NOT matching the pattern
+
+      # ── File/path restrictions ─────────────────────────────────────────────
+      - type: file_path_restriction
+        parameters:
+          restricted_file_paths:
+            - .github/workflows
+
+    exists: true   # Set to false to delete the ruleset
+```
+
+---
+
+### Secrets
+
+Manages Actions and Dependabot secrets. Secrets are always written (the action cannot read back secret values to detect drift, so they are re-applied on every run).
+
+```yaml
+secrets:
+  - key: MY_SECRET
+    env: ENV_VAR_NAME       # Read the value from this env variable on the runner
+    exists: true            # Set to false to delete the secret
+
+  - key: ANOTHER_SECRET
+    value: literal-value    # Embed the value directly — avoid for real secrets!
+
+  - key: OPTIONAL_SECRET
+    env: MAYBE_SET
+    required: false         # If MAYBE_SET is not set in env, skip without error
+
+  - key: DEPENDABOT_SECRET
+    env: MY_VALUE
+    type: dependabot        # Creates a Dependabot secret instead of an Actions secret
+```
+
+> **Tip:** Set environment variables on the workflow job from your repo's own secrets to sync secrets from one repo to another:
+> ```yaml
+> env:
+>   MY_VALUE: ${{ secrets.MY_VALUE }}
+> ```
+
+---
+
+### Variables
+
+Same structure as secrets, but values are readable — the action can detect drift and skip updates when the value is already correct.
+
+```yaml
+variables:
+  - key: MY_VARIABLE
+    value: "some value"
+    exists: true            # Set to false to delete the variable
+```
+
+---
+
+### Environments
+
+Manages deployment environments, including their secrets, variables, reviewers, wait timers, and deployment branch policies.
+
+```yaml
+environments:
+  - name: production
+    exists: true            # Set to false to delete the environment
+
+    wait_timer: 30          # Minutes to delay deployment (0–43200)
+    prevent_self_review: true
+
+    reviewers:              # Up to 6 users or teams
+      - name: my-org/my-team
+        type: team
+      - name: some-user
+        type: user
+
+    deployment_branch_policy:
+      protected_branches: false     # Exactly one of these must be true
+      custom_branch_policies: true
+
+    branch_name_patterns:           # Required when custom_branch_policies: true
+      - main
+      - release/*
+
+    secrets:
+      - key: PROD_SECRET
+        env: PROD_SECRET_VALUE
+        type: environments/production
+        exists: true
+
+    variables:
+      - key: PROD_VAR
+        value: "prod-value"
+        type: environments/production
+        exists: true
+```
+
+> **Permission note:** `environments: write` alone is not sufficient. The GitHub API also requires `actions: read` for the list-environments endpoint. Grant both permissions or the `environments` category will be skipped with a warning. See [Required Permissions](#required-permissions).
+
+---
+
+### File Sync (`batch_file_operations`)
+
+Copies, moves, renames, or deletes files in a target repo. Changes are committed to a `repomgr/updates-to-<target-branch>` branch and a pull request is opened (or updated if one already exists).
+
+**Key rules:**
+- `src_file` is always a path in the **local (runner) repo** unless prefixed with `remote://`, which means the file is in the **target repo**.
+- `dest_file` is always a path in the **target repo**. Defaults to the same path as `src_file` if omitted.
+- File operations within a batch are applied in order.
+- **Idempotent** — if a source file's git commit SHA has already been synced into the destination branch's history (tracked via a `[synced-from-sha:<sha>]` marker in commit messages), that file is skipped automatically on re-run.
+- If the sync branch already exists (e.g. a prior PR is still open), new commits are added on top and the PR description is updated — no duplicate PRs are created.
+- `overwrite: false` seeds a file only when it is absent in the target repo. See [Managed vs seeded files](#managed-vs-seeded-files).
+- Several batches may share a `target_branch`, each committing its own group of files with its own message into one shared PR. See [Grouping files](#grouping-files-with-their-own-commit-messages).
+- Unknown keys in a `files:` entry are rejected with a validation error, so typos cannot silently disable an option.
+
+```yaml
+batch_file_operations:
+  - target_branch: main     # Branch in the target repo to open a PR against
+    skip: false             # Set to true to skip this batch entirely
+    commit_msg: "chore(sync): update shared workflows"
+
+    files:
+      # Copy a file from the local repo to the same path in the target repo
+      - src_file: .github/workflows/ci.yml
+
+      # Copy and rename
+      - src_file: templates/issue-template.md
+        dest_file: .github/ISSUE_TEMPLATE/bug-report.md
+
+      # Move a file within the target repo (remote:// = file is already in target repo)
+      - src_file: remote://OLD_PATH/file.txt
+        dest_file: NEW_PATH/file.txt
+        move: true
+
+      # Seed a starter file only if the target repo does not already have one
+      - src_file: templates/CLAUDE.md
+        dest_file: CLAUDE.md
+        overwrite: false
+
+      # Delete a file from the target repo
+      - src_file: remote://OLDDOC.md
+        exists: false
+```
+
+**Batch options:**
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `target_branch` | repo default branch | Branch in the target repo to open a PR against. |
+| `commit_msg` | `chore: Updates from repo_manager` | Commit message for this group of files. |
+| `pr_title` | first line of the newest commit | Title of the pull request, and therefore the squash/merge commit message. |
+| `skip` | `false` | Set to `true` to skip this batch entirely. |
+| `files` | `[]` | The files in this group. |
+
+#### Grouping files with their own commit messages
+
+`batch_file_operations` is a list, and **several entries may share a `target_branch`**. Each entry is a separate group with its own `commit_msg`, and they all land on that branch's single `repomgr/updates-to-<target-branch>` branch and single pull request:
+
+```yaml
+batch_file_operations:
+  - target_branch: main
+    commit_msg: 'ci(standards): Seed starter files'
+    pr_title: 'chore(sync): Apply org standards'
+    files:
+      - src_file: templates/CLAUDE.md
+        dest_file: CLAUDE.md
+        overwrite: false
+
+  - target_branch: main
+    commit_msg: 'chore(workflows): Sync shared CI'
+    files:
+      - src_file: .github/workflows/ci.yml
+```
+
+produces one branch and one PR containing two commits:
+
+```text
+repomgr/updates-to-main
+  chore(workflows-update): Sync shared CI
+  ci(standards-update): Seed starter files
+```
+
+This keeps unrelated changes individually described in history — a reviewer can see which commit seeded standards and which synced workflows — while still reviewing and merging them together.
+
+Notes:
+
+- The PR body reports every group's changes; groups do not overwrite one another.
+- Push and PR creation happen **once per target branch**, however many groups contribute.
+- `pr_title` may be set on any one of the groups sharing a branch. If several set different titles, the first wins and a warning is logged. Without it the title falls back to the newest commit's subject, which with multiple groups is whichever group committed last — so setting it explicitly is worth it.
+- An explicitly configured `pr_title` is re-applied to an already-open PR. The commit-derived fallback is not, to avoid rewriting an open PR's title on every run.
+- Groups are applied in the order listed. If two groups write the same `dest_file` on the same branch, the later one wins and a warning is logged.
+- To give a group its own branch and PR instead, give it a different `target_branch`.
+
+**File options:**
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `src_file` | — | Path in the local (runner) repo, or `remote://<path>` for a path in the target repo. Required unless `exists: false`. |
+| `dest_file` | `src_file` | Path in the target repo. |
+| `exists` | `true` | Set to `false` to delete `dest_file` from the target repo. |
+| `move` | `false` | For `remote://` sources, remove `src_file` after the copy. Ignored for local sources. |
+| `overwrite` | `true` | Set to `false` to copy only when `dest_file` is absent in the target repo. |
+
+#### Managed vs seeded files
+
+`overwrite` distinguishes two genuinely different distribution intents:
+
+**Managed files** (`overwrite: true`, the default) are meant to be *identical everywhere*. The action re-copies them whenever the source changes, so an edit in the target repo is replaced on the next sync. Use this for files whose whole purpose is to enforce a standard — shared workflows, linter configs, license headers, `CODEOWNERS`.
+
+**Seeded files** (`overwrite: false`) are *per-repo starting points*. The action writes the file once, when it is absent, and thereafter leaves it alone regardless of its contents. Ownership transfers to the consuming team on first sync. Use this for files each repo necessarily diverges from — a `CLAUDE.md` starter contract each repo extends, or a config carrying that repo's own name, owners, and deployment targets.
+
+```yaml
+batch_file_operations:
+  - target_branch: main
+    commit_msg: 'ci(standards): Seed starter files'
+    files:
+      - src_file: templates/CLAUDE.md
+        dest_file: CLAUDE.md
+        overwrite: false        # seed only; never replace an existing file
+```
+
+**The trade-off is explicit and is the point of the flag: seeded files do not receive later upstream updates.** Once a target repo has the file, improvements to your template will never reach it. There is no diffing, merging, or three-way reconciliation — existence alone decides. If you need upstream changes to propagate, the file is a managed file, not a seeded one.
+
+Notes:
+
+- A seeded file that is already present is the **intended steady state**. With `action: check` it is not reported as `missing`, `extra`, or `diff`; it does not fail the run, and it produces no sync branch or pull request. If every entry in a `files:` block is skipped, nothing is committed and no PR is opened.
+- `overwrite: false` does **not** consult the `[synced-from-sha:<sha>]` history. A source SHA identifies a commit rather than a single file, so files committed together share one marker; gating on history could suppress a seed that had never actually been written. Existence in the target repo is the entire rule.
+- `overwrite: false` cannot be combined with `exists: false` (nothing to seed if the file is being deleted) or with `move: true` (a skipped move would leave the source in place and copy nothing). Both combinations fail validation.
+
+---
+
+## Usage Patterns
+
+### Self-managed (single repo)
+
+Apply settings to the repo the workflow runs in on every push to `main`:
+
+```yaml
+name: Apply Repo Settings
+on:
+  push:
+    branches: [main]
+    paths: ['.github/settings.yml']
+  workflow_dispatch:
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actuarysailor/gha-repo-manager@v2.2.3
+        with:
+          action: apply
+          settings_file: .github/settings.yml
+          app_id: ${{ vars.REPO_MANAGER_APP_ID }}
+          private_key: ${{ secrets.REPO_MANAGER_PRIVATE_KEY }}
+```
+
+---
+
+### Centralized governance (many repos)
+
+Run from a central `.github` or governance repo to manage settings across many repos. Each repo gets its own settings file in the central repo:
+
+```yaml
+name: Enforce Repo Standards
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'   # Weekly drift check
+  workflow_dispatch:
+
+jobs:
+  manage:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        repo: [my-org/repo-a, my-org/repo-b, my-org/repo-c]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actuarysailor/gha-repo-manager@v2.2.3
+        with:
+          action: apply
+          repo: ${{ matrix.repo }}
+          settings_file: settings/${{ matrix.repo }}.yml
+          app_id: ${{ vars.REPO_MANAGER_APP_ID }}
+          private_key: ${{ secrets.REPO_MANAGER_PRIVATE_KEY }}
+```
+
+---
+
+### Drift detection on pull requests
+
+Check for configuration drift on every PR that touches `settings.yml`, without applying any changes:
+
+```yaml
+name: Check Repo Settings
+on:
+  pull_request:
+    paths: ['.github/settings.yml']
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actuarysailor/gha-repo-manager@v2.2.3
+        with:
+          action: check
+          fail_on_diff: true
+          settings_file: .github/settings.yml
+          app_id: ${{ vars.REPO_MANAGER_APP_ID }}
+          private_key: ${{ secrets.REPO_MANAGER_PRIVATE_KEY }}
+```
+
+---
+
+## Debugging
+
+Enable [GitHub Actions debug logging](https://docs.github.com/en/actions/monitoring-and-troubleshooting-workflows/enabling-debug-logging) by setting the `ACTIONS_STEP_DEBUG` secret to `true` on your repo. This will output:
+
+- The GitHub App installation permissions and repository selection at startup.
+- A direct API probe against the failing endpoint whenever a `403` occurs, showing the exact permission required (`x-accepted-github-permissions` response header).
+- Full input/output diffs for every settings category.
+
+---
+
+## Contributing
+
+Please see [CONTRIBUTING.md](./CONTRIBUTING.md) for how to contribute. All participants must follow the [Code of Conduct](./CODE_OF_CONDUCT.md).
+
+<!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section -->
+<!-- prettier-ignore-start -->
+<!-- markdownlint-disable -->
+<table>
+  <tbody>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/actuarysailor"><img src="https://avatars.githubusercontent.com/u/1377314?v=4?s=100" width="100px;" alt="Andrew"/><br /><sub><b>Andrew</b></sub></a><br /><a href="#ideas-actuarysailor" title="Ideas, Planning, & Feedback">🤔</a> <a href="https://github.com/actuarysailor/gha-repo-manager/commits?author=actuarysailor" title="Tests">⚠️</a> <a href="https://github.com/actuarysailor/gha-repo-manager/commits?author=actuarysailor" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/actuarysailor"><img src="https://avatars.githubusercontent.com/u/24359398?v=4?s=100" width="100px;" alt="shiro"/><br /><sub><b>shiro</b></sub></a><br /><a href="https://github.com/actuarysailor/gha-repo-manager/issues?q=author%3Aactuarysailor" title="Bug reports">🐛</a> <a href="https://github.com/actuarysailor/gha-repo-manager/commits?author=actuarysailor" title="Code">💻</a></td>
+    </tr>
+  </tbody>
+</table>
+<!-- markdownlint-restore -->
+<!-- prettier-ignore-end -->
+<!-- ALL-CONTRIBUTORS-LIST:END -->
